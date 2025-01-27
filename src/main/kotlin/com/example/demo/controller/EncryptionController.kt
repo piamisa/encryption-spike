@@ -1,80 +1,127 @@
 package com.example.demo.controller
 
 import com.nimbusds.jose.*
-import com.nimbusds.jose.crypto.MACSigner
-import com.nimbusds.jwt.JWTClaimsSet
-import com.nimbusds.jwt.SignedJWT
+import com.nimbusds.jose.crypto.*
+import com.nimbusds.jose.jwk.*
+import com.nimbusds.jose.jwk.gen.RSAKeyGenerator
 import org.springframework.web.bind.annotation.*
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import java.io.File
+import java.nio.file.Files
+import java.security.interfaces.RSAPrivateKey
+import java.security.interfaces.RSAPublicKey
+import java.util.*
 
 @RestController
 @RequestMapping("/encryption")
 class EncryptionController {
 
-    private fun saveKeyToKeyring(keyName: String, secret: String): Boolean {
-        val process = ProcessBuilder("keyctl", "add", "user", keyName, secret, "@u")
-            .redirectErrorStream(true)
-            .start()
-        process.waitFor()
-        return process.exitValue() == 0
+    private val signerKey: RSAKey by lazy { generateRSAKey() }
+    private val encrypterKey: RSAKey by lazy { generateRSAKey() }
+
+    @PostMapping("/sign")
+    fun signFile(@RequestParam filePath: String): String {
+        val file = File(filePath)
+        if (!file.exists()) return "El archivo no existe: $filePath"
+
+        val payload = Files.readString(file.toPath())
+        val signedContent = signContent(payload)
+        val outputFilePath = "$filePath.signed"
+        File(outputFilePath).writeText(signedContent)
+
+        return "Archivo firmado exitosamente: $outputFilePath"
     }
 
-    private fun getKeyFromKeyring(keyName: String): String? {
-        return try {
-            // Crea y ejecuta el proceso para leer la clave
-            val process = ProcessBuilder("keyctl", "read", keyName)
-                .redirectErrorStream(true)
-                .start()
+    @PostMapping("/encrypt")
+    fun encryptFile(@RequestParam filePath: String): String {
+        val file = File(filePath)
+        if (!file.exists()) return "El archivo no existe: $filePath"
 
-            // Lee la salida del proceso
-            val output = process.inputStream.bufferedReader().use { it.readText().trim() }
+        val payload = Files.readString(file.toPath())
+        val encryptedContent = encryptContent(payload)
+        val outputFilePath = "$filePath.encrypted"
+        File(outputFilePath).writeText(encryptedContent)
 
-            // Espera la finalización del proceso y verifica el resultado
-            if (process.waitFor() == 0) {
-                output // Retorna la clave si el proceso fue exitoso
-            } else {
-                val error = process.errorStream.bufferedReader().use { it.readText().trim() }
-                println("Error reading key '$keyName' from keyring: $error")
-                null // Retorna null si hubo un error
-            }
-        } catch (e: Exception) {
-            println("Exception while reading key '$keyName': ${e.message}")
-            null // Retorna null en caso de excepción
-        }
+        return "Archivo encriptado exitosamente: $outputFilePath"
     }
 
+    @PostMapping("/decrypt")
+    fun decryptFile(@RequestParam filePath: String): String {
+        val success = processDecryption(filePath)
+        return if (success) "Archivo desencriptado exitosamente: $filePath.decrypted"
+        else "Error al desencriptar el archivo."
+    }
 
-    private fun signJWT(secret: ByteArray): String {
-        val claimsSet = JWTClaimsSet.Builder()
-            .subject("user123")
-            .issuer("my-app")
-            .claim("role", "admin")
-            .build()
+    @PostMapping("/sign-encrypt")
+    fun signAndEncryptFile(@RequestParam filePath: String): String {
+        val file = File(filePath)
+        if (!file.exists()) return "El archivo no existe: $filePath"
 
-        val signedJWT = SignedJWT(
-            JWSHeader(JWSAlgorithm.HS256),
-            claimsSet
+        val payload = Files.readString(file.toPath())
+        val signedContent = signContent(payload)
+        val encryptedContent = encryptContent(signedContent)
+        val outputFilePath = "$filePath.signed-encrypted"
+        File(outputFilePath).writeText(encryptedContent)
+
+        return "Archivo firmado y encriptado exitosamente: $outputFilePath"
+    }
+
+    private fun signContent(payload: String): String {
+        val jwsObject = JWSObject(
+            JWSHeader.Builder(JWSAlgorithm.RS256).keyID(signerKey.keyID).build(),
+            Payload(payload)
         )
-
-        signedJWT.sign(MACSigner(secret))
-        return signedJWT.serialize()
+        val signer = RSASSASigner(signerKey.toPrivateKey() as RSAPrivateKey)
+        jwsObject.sign(signer)
+        return jwsObject.serialize()
     }
 
-    @PostMapping("/save-key")
-    fun saveKey(@RequestParam keyName: String, @RequestParam secret: String): String {
-        return if (saveKeyToKeyring(keyName, secret)) {
-            "Key '$keyName' saved successfully in keyring."
-        } else {
-            "Failed to save key '$keyName' in keyring."
+    private fun encryptContent(payload: String): String {
+        val jweObject = JWEObject(
+            JWEHeader.Builder(JWEAlgorithm.RSA_OAEP_256, EncryptionMethod.A128GCM)
+                .keyID(encrypterKey.keyID)
+                .build(),
+            Payload(payload)
+        )
+        val encrypter = RSAEncrypter(encrypterKey.toPublicKey() as RSAPublicKey)
+        jweObject.encrypt(encrypter)
+        return jweObject.serialize()
+    }
+
+    private fun processDecryption(filePath: String): Boolean {
+        val file = File(filePath)
+        if (!file.exists()) return false
+
+        // Leer el contenido encriptado
+        val encryptedContent = file.readText()
+
+        // Desencriptar el contenido
+        val decryptedContent = decryptContent(encryptedContent)
+
+        // Guardar el archivo desencriptado
+        val outputFilePath = "$filePath.decrypted"
+        File(outputFilePath).writeText(decryptedContent)
+
+        return true
+    }
+
+    private fun decryptContent(encryptedContent: String): String {
+        val jweObject = JWEObject.parse(encryptedContent)
+
+        // Crear un desencriptador con la clave privada
+        val decrypter = RSADecrypter(encrypterKey.toPrivateKey() as RSAPrivateKey)
+
+        // Desencriptar el contenido
+        jweObject.decrypt(decrypter)
+
+        // Retornar el texto desencriptado
+        return jweObject.payload.toString()
+    }
+
+    companion object {
+        fun generateRSAKey(): RSAKey {
+            return RSAKeyGenerator(2048)
+                .keyID(UUID.randomUUID().toString())
+                .generate()
         }
-    }
-
-    @GetMapping("/get-jwt")
-    fun getSignedJWT(@RequestParam keyName: String): String {
-        val secret = getKeyFromKeyring(keyName)?.toByteArray(Charsets.UTF_8)
-            ?: throw IllegalStateException("Key '$keyName' not found in keyring.")
-
-        return signJWT(secret)
     }
 }
